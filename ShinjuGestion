@@ -1,0 +1,519 @@
+import discord
+from discord.ext import commands
+from discord import app_commands
+import json
+import os
+import asyncio
+from datetime import datetime, timedelta
+import logging
+
+# Configuration du logging
+logging.basicConfig(level=logging.INFO)
+
+# Configuration
+TOKEN = os.getenv('TOKEN', 'VOTRE_TOKEN_BOT')
+GUILD_ID = int(os.getenv('GUILD_ID', '0'))  # ID de votre serveur
+LOG_CHANNEL_ID = int(os.getenv('LOG_CHANNEL_ID', '0'))  # ID du salon de logs
+
+# Configuration des intents
+intents = discord.Intents.default()
+intents.message_content = True
+intents.members = True
+intents.moderation = True
+
+# Création du bot avec préfixe /
+class ModerationBot(commands.Bot):
+    def __init__(self):
+        super().__init__(
+            command_prefix='/',
+            intents=intents,
+            help_command=None
+        )
+        
+    async def setup_hook(self):
+        # Synchronisation des commandes slash
+        try:
+            if GUILD_ID != 0:
+                guild = discord.Object(id=GUILD_ID)
+                synced = await self.tree.sync(guild=guild)
+                print(f"Synchronisées {len(synced)} commande(s) pour la guilde {GUILD_ID}")
+            else:
+                synced = await self.tree.sync()
+                print(f"Synchronisées {len(synced)} commande(s) globalement")
+        except Exception as e:
+            print(f"Erreur lors de la synchronisation: {e}")
+
+    async def on_ready(self):
+        print(f'{self.user} est connecté!')
+        await self.change_presence(
+            activity=discord.Activity(
+                type=discord.ActivityType.watching,
+                name="la gestion du serveur | Préfixe: /"
+            )
+        )
+
+bot = ModerationBot()
+
+# Système de sauvegarde des avertissements
+WARNINGS_FILE = 'warnings.json'
+
+def load_warnings():
+    try:
+        with open(WARNINGS_FILE, 'r') as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return {}
+
+def save_warnings(warnings):
+    with open(WARNINGS_FILE, 'w') as f:
+        json.dump(warnings, f, indent=2)
+
+warnings_data = load_warnings()
+
+# Fonction pour créer des embeds
+def create_embed(title, description, color=discord.Color.blue()):
+    embed = discord.Embed(
+        title=title,
+        description=description,
+        color=color,
+        timestamp=datetime.now()
+    )
+    return embed
+
+# Fonction de logging
+async def log_action(guild, action, moderator, target, reason="Aucune raison fournie"):
+    if LOG_CHANNEL_ID == 0:
+        return
+    
+    channel = guild.get_channel(LOG_CHANNEL_ID)
+    if not channel:
+        return
+    
+    embed = create_embed(
+        f"🔨 {action}",
+        f"**Modérateur:** {moderator}\n**Cible:** {target}\n**Raison:** {reason}",
+        discord.Color.red()
+    )
+    
+    try:
+        await channel.send(embed=embed)
+    except Exception as e:
+        print(f"Erreur lors de l'envoi du log: {e}")
+
+# Vérification des permissions
+def has_permissions():
+    async def predicate(interaction: discord.Interaction):
+        return interaction.user.guild_permissions.moderate_members
+    return app_commands.check(predicate)
+
+# Commandes Slash
+
+@bot.tree.command(name="ban", description="Bannir un membre du serveur")
+@app_commands.describe(
+    utilisateur="L'utilisateur à bannir",
+    raison="Raison du bannissement",
+    supprimer_messages="Nombre de jours de messages à supprimer (0-7)"
+)
+@has_permissions()
+async def ban(interaction: discord.Interaction, utilisateur: discord.Member, raison: str = "Aucune raison fournie", supprimer_messages: int = 0):
+    if supprimer_messages < 0 or supprimer_messages > 7:
+        supprimer_messages = 0
+    
+    try:
+        await utilisateur.ban(reason=raison, delete_message_days=supprimer_messages)
+        
+        embed = create_embed(
+            "🔨 Utilisateur banni",
+            f"**Utilisateur:** {utilisateur.mention} ({utilisateur})\n**Raison:** {raison}\n**Messages supprimés:** {supprimer_messages} jour(s)",
+            discord.Color.red()
+        )
+        
+        await interaction.response.send_message(embed=embed)
+        await log_action(interaction.guild, "Bannissement", str(interaction.user), str(utilisateur), raison)
+        
+    except discord.Forbidden:
+        await interaction.response.send_message("❌ Je n'ai pas les permissions pour bannir cet utilisateur.", ephemeral=True)
+    except Exception as e:
+        await interaction.response.send_message(f"❌ Erreur: {str(e)}", ephemeral=True)
+
+@bot.tree.command(name="kick", description="Expulser un membre du serveur")
+@app_commands.describe(
+    utilisateur="L'utilisateur à expulser",
+    raison="Raison de l'expulsion"
+)
+@has_permissions()
+async def kick(interaction: discord.Interaction, utilisateur: discord.Member, raison: str = "Aucune raison fournie"):
+    try:
+        await utilisateur.kick(reason=raison)
+        
+        embed = create_embed(
+            "👢 Utilisateur expulsé",
+            f"**Utilisateur:** {utilisateur.mention} ({utilisateur})\n**Raison:** {raison}",
+            discord.Color.orange()
+        )
+        
+        await interaction.response.send_message(embed=embed)
+        await log_action(interaction.guild, "Expulsion", str(interaction.user), str(utilisateur), raison)
+        
+    except discord.Forbidden:
+        await interaction.response.send_message("❌ Je n'ai pas les permissions pour expulser cet utilisateur.", ephemeral=True)
+    except Exception as e:
+        await interaction.response.send_message(f"❌ Erreur: {str(e)}", ephemeral=True)
+
+@bot.tree.command(name="warn", description="Avertir un membre")
+@app_commands.describe(
+    utilisateur="L'utilisateur à avertir",
+    raison="Raison de l'avertissement"
+)
+@has_permissions()
+async def warn(interaction: discord.Interaction, utilisateur: discord.Member, raison: str):
+    user_id = str(utilisateur.id)
+    
+    if user_id not in warnings_data:
+        warnings_data[user_id] = []
+    
+    warning = {
+        "reason": raison,
+        "moderator": str(interaction.user),
+        "date": datetime.now().isoformat()
+    }
+    
+    warnings_data[user_id].append(warning)
+    save_warnings(warnings_data)
+    
+    embed = create_embed(
+        "⚠️ Utilisateur averti",
+        f"**Utilisateur:** {utilisateur.mention} ({utilisateur})\n**Raison:** {raison}\n**Total d'avertissements:** {len(warnings_data[user_id])}",
+        discord.Color.yellow()
+    )
+    
+    await interaction.response.send_message(embed=embed)
+    await log_action(interaction.guild, "Avertissement", str(interaction.user), str(utilisateur), raison)
+    
+    # Auto-modération après 3 avertissements
+    if len(warnings_data[user_id]) >= 3:
+        try:
+            await utilisateur.timeout(timedelta(hours=24), reason="Auto-mute: 3 avertissements")
+            await interaction.followup.send(f"🔇 {utilisateur.mention} a été automatiquement mis en sourdine pour 24h (3 avertissements).")
+        except discord.Forbidden:
+            await interaction.followup.send("⚠️ Impossible d'appliquer l'auto-mute (permissions insuffisantes).")
+
+@bot.tree.command(name="mute", description="Mettre en sourdine un membre")
+@app_commands.describe(
+    utilisateur="L'utilisateur à mettre en sourdine",
+    duree="Durée en minutes",
+    raison="Raison de la mise en sourdine"
+)
+@has_permissions()
+async def mute(interaction: discord.Interaction, utilisateur: discord.Member, duree: int, raison: str = "Aucune raison fournie"):
+    try:
+        await utilisateur.timeout(timedelta(minutes=duree), reason=raison)
+        
+        embed = create_embed(
+            "🔇 Utilisateur mis en sourdine",
+            f"**Utilisateur:** {utilisateur.mention} ({utilisateur})\n**Durée:** {duree} minute(s)\n**Raison:** {raison}",
+            discord.Color.greyple()
+        )
+        
+        await interaction.response.send_message(embed=embed)
+        await log_action(interaction.guild, "Mise en sourdine", str(interaction.user), str(utilisateur), raison)
+        
+    except discord.Forbidden:
+        await interaction.response.send_message("❌ Je n'ai pas les permissions pour mettre en sourdine cet utilisateur.", ephemeral=True)
+    except Exception as e:
+        await interaction.response.send_message(f"❌ Erreur: {str(e)}", ephemeral=True)
+
+@bot.tree.command(name="unmute", description="Retirer la sourdine d'un membre")
+@app_commands.describe(utilisateur="L'utilisateur à démuter")
+@has_permissions()
+async def unmute(interaction: discord.Interaction, utilisateur: discord.Member):
+    try:
+        await utilisateur.timeout(None)
+        
+        embed = create_embed(
+            "🔊 Sourdine retirée",
+            f"**Utilisateur:** {utilisateur.mention} ({utilisateur})",
+            discord.Color.green()
+        )
+        
+        await interaction.response.send_message(embed=embed)
+        await log_action(interaction.guild, "Retrait de sourdine", str(interaction.user), str(utilisateur))
+        
+    except discord.Forbidden:
+        await interaction.response.send_message("❌ Je n'ai pas les permissions nécessaires.", ephemeral=True)
+    except Exception as e:
+        await interaction.response.send_message(f"❌ Erreur: {str(e)}", ephemeral=True)
+
+@bot.tree.command(name="clear", description="Supprimer des messages")
+@app_commands.describe(
+    nombre="Nombre de messages à supprimer (1-100)",
+    utilisateur="Supprimer les messages d'un utilisateur spécifique"
+)
+@has_permissions()
+async def clear(interaction: discord.Interaction, nombre: int, utilisateur: discord.Member = None):
+    if nombre < 1 or nombre > 100:
+        await interaction.response.send_message("❌ Le nombre doit être entre 1 et 100.", ephemeral=True)
+        return
+    
+    await interaction.response.defer(ephemeral=True)
+    
+    try:
+        if utilisateur:
+            def check(message):
+                return message.author == utilisateur
+            deleted = await interaction.channel.purge(limit=nombre*2, check=check)
+            deleted = deleted[:nombre]
+        else:
+            deleted = await interaction.channel.purge(limit=nombre)
+        
+        embed = create_embed(
+            "🗑️ Messages supprimés",
+            f"**Nombre:** {len(deleted)} message(s)\n**Salon:** {interaction.channel.mention}\n" + 
+            (f"**Utilisateur ciblé:** {utilisateur.mention}" if utilisateur else ""),
+            discord.Color.green()
+        )
+        
+        await interaction.followup.send(embed=embed, ephemeral=True)
+        await log_action(interaction.guild, "Suppression de messages", str(interaction.user), f"{len(deleted)} messages")
+        
+    except discord.Forbidden:
+        await interaction.followup.send("❌ Je n'ai pas les permissions pour supprimer des messages.", ephemeral=True)
+    except Exception as e:
+        await interaction.followup.send(f"❌ Erreur: {str(e)}", ephemeral=True)
+
+@bot.tree.command(name="warnings", description="Voir les avertissements d'un utilisateur")
+@app_commands.describe(utilisateur="L'utilisateur à vérifier")
+async def warnings(interaction: discord.Interaction, utilisateur: discord.Member):
+    user_id = str(utilisateur.id)
+    user_warnings = warnings_data.get(user_id, [])
+    
+    if not user_warnings:
+        await interaction.response.send_message(f"{utilisateur.mention} n'a aucun avertissement.", ephemeral=True)
+        return
+    
+    embed = discord.Embed(
+        title=f"⚠️ Avertissements de {utilisateur.display_name}",
+        color=discord.Color.yellow(),
+        timestamp=datetime.now()
+    )
+    embed.set_thumbnail(url=utilisateur.display_avatar.url)
+    
+    for i, warning in enumerate(user_warnings[:10], 1):  # Limite à 10 pour éviter les embeds trop longs
+        date = datetime.fromisoformat(warning['date']).strftime("%d/%m/%Y %H:%M")
+        embed.add_field(
+            name=f"Avertissement #{i}",
+            value=f"**Raison:** {warning['reason']}\n**Modérateur:** {warning['moderator']}\n**Date:** {date}",
+            inline=False
+        )
+    
+    if len(user_warnings) > 10:
+        embed.set_footer(text=f"... et {len(user_warnings) - 10} autre(s) avertissement(s)")
+    
+    await interaction.response.send_message(embed=embed)
+
+@bot.tree.command(name="serverinfo", description="Informations sur le serveur")
+async def serverinfo(interaction: discord.Interaction):
+    guild = interaction.guild
+    
+    embed = discord.Embed(
+        title="📊 Informations du serveur",
+        color=discord.Color.blue(),
+        timestamp=datetime.now()
+    )
+    
+    if guild.icon:
+        embed.set_thumbnail(url=guild.icon.url)
+    
+    embed.add_field(name="🏷️ Nom", value=guild.name, inline=True)
+    embed.add_field(name="👑 Propriétaire", value=guild.owner.mention if guild.owner else "Inconnu", inline=True)
+    embed.add_field(name="📅 Créé le", value=guild.created_at.strftime("%d/%m/%Y"), inline=True)
+    embed.add_field(name="👥 Membres", value=guild.member_count, inline=True)
+    embed.add_field(name="💬 Salons", value=len(guild.channels), inline=True)
+    embed.add_field(name="🎭 Rôles", value=len(guild.roles), inline=True)
+    embed.add_field(name="😀 Emojis", value=len(guild.emojis), inline=True)
+    embed.add_field(name="🔧 Niveau de vérif.", value=str(guild.verification_level).title(), inline=True)
+    
+    await interaction.response.send_message(embed=embed)
+
+@bot.tree.command(name="userinfo", description="Informations sur un utilisateur")
+@app_commands.describe(utilisateur="L'utilisateur à vérifier")
+async def userinfo(interaction: discord.Interaction, utilisateur: discord.Member = None):
+    if utilisateur is None:
+        utilisateur = interaction.user
+    
+    embed = discord.Embed(
+        title=f"👤 Informations de {utilisateur.display_name}",
+        color=utilisateur.color if utilisateur.color != discord.Color.default() else discord.Color.blue(),
+        timestamp=datetime.now()
+    )
+    
+    embed.set_thumbnail(url=utilisateur.display_avatar.url)
+    
+    embed.add_field(name="🏷️ Nom d'utilisateur", value=str(utilisateur), inline=True)
+    embed.add_field(name="🆔 ID", value=utilisateur.id, inline=True)
+    embed.add_field(name="📅 Compte créé", value=utilisateur.created_at.strftime("%d/%m/%Y"), inline=True)
+    embed.add_field(name="📅 Rejoint le serveur", value=utilisateur.joined_at.strftime("%d/%m/%Y"), inline=True)
+    embed.add_field(name="🎭 Rôle principal", value=utilisateur.top_role.mention, inline=True)
+    embed.add_field(name="📱 Statut", value=str(utilisateur.status).title(), inline=True)
+    
+    roles = [role.mention for role in utilisateur.roles[1:]]  # Exclut @everyone
+    if roles:
+        embed.add_field(name="🎭 Rôles", value=" ".join(roles[:10]), inline=False)
+        if len(roles) > 10:
+            embed.set_footer(text=f"... et {len(roles) - 10} autre(s) rôle(s)")
+    
+    await interaction.response.send_message(embed=embed)
+
+@bot.tree.command(name="lock", description="Verrouiller un salon")
+@app_commands.describe(
+    salon="Le salon à verrouiller",
+    raison="Raison du verrouillage"
+)
+@has_permissions()
+async def lock(interaction: discord.Interaction, salon: discord.TextChannel = None, raison: str = "Aucune raison fournie"):
+    if salon is None:
+        salon = interaction.channel
+    
+    try:
+        await salon.set_permissions(interaction.guild.default_role, send_messages=False)
+        
+        embed = create_embed(
+            "🔒 Salon verrouillé",
+            f"**Salon:** {salon.mention}\n**Raison:** {raison}",
+            discord.Color.red()
+        )
+        
+        await interaction.response.send_message(embed=embed)
+        await log_action(interaction.guild, "Verrouillage de salon", str(interaction.user), salon.name, raison)
+        
+    except discord.Forbidden:
+        await interaction.response.send_message("❌ Je n'ai pas les permissions pour verrouiller ce salon.", ephemeral=True)
+    except Exception as e:
+        await interaction.response.send_message(f"❌ Erreur: {str(e)}", ephemeral=True)
+
+@bot.tree.command(name="unlock", description="Déverrouiller un salon")
+@app_commands.describe(salon="Le salon à déverrouiller")
+@has_permissions()
+async def unlock(interaction: discord.Interaction, salon: discord.TextChannel = None):
+    if salon is None:
+        salon = interaction.channel
+    
+    try:
+        await salon.set_permissions(interaction.guild.default_role, send_messages=None)
+        
+        embed = create_embed(
+            "🔓 Salon déverrouillé",
+            f"**Salon:** {salon.mention}",
+            discord.Color.green()
+        )
+        
+        await interaction.response.send_message(embed=embed)
+        await log_action(interaction.guild, "Déverrouillage de salon", str(interaction.user), salon.name)
+        
+    except discord.Forbidden:
+        await interaction.response.send_message("❌ Je n'ai pas les permissions pour déverrouiller ce salon.", ephemeral=True)
+    except Exception as e:
+        await interaction.response.send_message(f"❌ Erreur: {str(e)}", ephemeral=True)
+
+# Commandes préfixées avec /
+
+@bot.command(name='help')
+async def help_command(ctx):
+    """Affiche l'aide du bot"""
+    embed = discord.Embed(
+        title="🤖 Aide du Bot de Gestion",
+        description="Voici toutes les commandes disponibles:",
+        color=discord.Color.blue()
+    )
+    
+    moderation_commands = [
+        "🔨 `/ban <utilisateur> [raison]` - Bannir un utilisateur",
+        "👢 `/kick <utilisateur> [raison]` - Expulser un utilisateur",
+        "⚠️ `/warn <utilisateur> <raison>` - Avertir un utilisateur",
+        "🔇 `/mute <utilisateur> <durée>` - Mettre en sourdine",
+        "🔊 `/unmute <utilisateur>` - Retirer la sourdine",
+        "🗑️ `/clear <nombre>` - Supprimer des messages",
+        "🔒 `/lock [salon]` - Verrouiller un salon",
+        "🔓 `/unlock [salon]` - Déverrouiller un salon"
+    ]
+    
+    info_commands = [
+        "📊 `/serverinfo` - Informations du serveur",
+        "👤 `/userinfo [utilisateur]` - Informations utilisateur",
+        "⚠️ `/warnings <utilisateur>` - Voir les avertissements"
+    ]
+    
+    embed.add_field(name="🛡️ Modération", value="\n".join(moderation_commands), inline=False)
+    embed.add_field(name="ℹ️ Informations", value="\n".join(info_commands), inline=False)
+    embed.add_field(name="📝 Notes", value="• Les commandes de modération nécessitent les permissions appropriées\n• Auto-mute après 3 avertissements\n• Toutes les actions sont enregistrées", inline=False)
+    
+    await ctx.send(embed=embed)
+
+@bot.command(name='ping')
+async def ping(ctx):
+    """Teste la latence du bot"""
+    latency = round(bot.latency * 1000)
+    embed = create_embed(
+        "🏓 Pong!",
+        f"Latence: {latency}ms",
+        discord.Color.green()
+    )
+    await ctx.send(embed=embed)
+
+# Events
+
+@bot.event
+async def on_member_join(member):
+    """Message de bienvenue pour les nouveaux membres"""
+    # Cherche un salon "bienvenue" ou "welcome"
+    welcome_channel = discord.utils.find(
+        lambda x: x.name in ['bienvenue', 'welcome', 'général', 'general'],
+        member.guild.text_channels
+    )
+    
+    if welcome_channel:
+        embed = create_embed(
+            "👋 Bienvenue!",
+            f"Bienvenue {member.mention} sur **{member.guild.name}**!\n\n"
+            f"N'oubliez pas de lire les règles et de vous présenter.\n"
+            f"Nous sommes maintenant **{member.guild.member_count}** membres!",
+            discord.Color.green()
+        )
+        embed.set_thumbnail(url=member.display_avatar.url)
+        
+        try:
+            await welcome_channel.send(embed=embed)
+        except discord.Forbidden:
+            print(f"Impossible d'envoyer le message de bienvenue dans {welcome_channel.name}")
+
+@bot.event
+async def on_member_remove(member):
+    """Log quand un membre quitte"""
+    await log_action(member.guild, "Membre parti", "Système", str(member))
+
+@bot.event
+async def on_command_error(ctx, error):
+    """Gestion des erreurs de commandes"""
+    if isinstance(error, commands.CommandNotFound):
+        return
+    elif isinstance(error, commands.MissingPermissions):
+        await ctx.send("❌ Vous n'avez pas les permissions nécessaires pour cette commande.")
+    elif isinstance(error, commands.MemberNotFound):
+        await ctx.send("❌ Membre introuvable.")
+    else:
+        print(f"Erreur de commande: {error}")
+        await ctx.send("❌ Une erreur est survenue lors de l'exécution de la commande.")
+
+# Gestion des erreurs globales
+@bot.event
+async def on_error(event, *args, **kwargs):
+    print(f"Erreur dans {event}: {args}, {kwargs}")
+
+# Démarrage du bot
+if __name__ == "__main__":
+    try:
+        bot.run(TOKEN)
+    except discord.LoginFailure:
+        print("❌ Token invalide! Vérifiez votre TOKEN dans les variables d'environnement.")
+    except Exception as e:
+        print(f"❌ Erreur lors du démarrage: {e}")
